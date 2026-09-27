@@ -251,6 +251,53 @@ class ApiHandler(BaseHTTPRequestHandler):
         )
         self._send_json(200, result)
 
+    # ----------------------------------------------------- 证据有效期
+    def set_version_expiry(self, version_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.inspections.set_expiry(
+            actor,
+            version_id=version_id,
+            valid_until_local_iso=body["valid_until_local_iso"],
+            valid_until_timezone=body.get("valid_until_timezone"),
+            source=body.get("source", ""),
+            note=body.get("note", ""),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(200, result)
+
+    def get_version_expiry(self, version_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, self.services.inspections.get_expiry(actor, version_id)
+        )
+
+    def run_inspection(self) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.inspections.run_inspection(
+            actor,
+            warning_days=int(body.get("warning_days", 30)),
+            institution_id=body.get("institution_id"),
+            note=body.get("note", ""),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def list_inspections(self) -> None:
+        actor = self._actor()
+        from urllib.parse import parse_qs
+
+        query = parse_qs(urlparse(self.path).query)
+        limit = int(query.get("limit", ["50"])[0])
+        self._send_json(200, self.services.inspections.list_batches(actor, limit))
+
+    def get_inspection(self, batch_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, self.services.inspections.get_batch_view(actor, batch_id)
+        )
+
     # --------------------------------------------------------- 评审包
     def create_package(self) -> None:
         actor = self._actor()
@@ -404,6 +451,8 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/materials/{material_id}/versions", "upload_version"),
         ("/v1/materials/{material_id}/withdraw", "withdraw_material"),
         ("/v1/versions/{version_id}/withdraw", "withdraw_version"),
+        ("/v1/versions/{version_id}/expiry", "set_version_expiry"),
+        ("/v1/inspections", "run_inspection"),
         ("/v1/packages", "create_package"),
         ("/v1/packages/{package_id}/entries", "add_entry"),
         ("/v1/packages/{package_id}/seal", "seal_package"),
@@ -417,6 +466,7 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
     get = [
         ("/v1/materials/{material_id}", "get_material"),
         ("/v1/versions/{version_id}", "get_version"),
+        ("/v1/versions/{version_id}/expiry", "get_version_expiry"),
         ("/v1/packages", "list_packages"),
         ("/v1/packages/{package_id}", "get_package"),
         ("/v1/packages/{package_id}/requests", "list_requests"),
@@ -424,6 +474,8 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",
         ),
+        ("/v1/inspections", "list_inspections"),
+        ("/v1/inspections/{batch_id}", "get_inspection"),
     ]
     return {"POST": post, "GET": get}
 

@@ -49,3 +49,8 @@ class Decision(str, Enum):
     APPROVED = "approved"
     NEEDS_REVISION = "needs_revision"
     REJECTED = "rejected"
+
+
+class InspectionCategory(str, Enum):
+    EXPIRING = "expiring"  # 即将过期：未失效但落在预警窗口内
+    EXPIRED = "expired"    # 已过期：有效期已过

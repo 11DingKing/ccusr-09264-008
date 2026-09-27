@@ -70,6 +70,40 @@ python3 -m service_09252_006.cli serve \
   --bootstrap-token "$BOOTSTRAP_TOKEN"
 ```
 
+## 证据有效期巡检
+
+每份证据版本可登记有效期（`valid_until`，当地时间+IANA 时区，统一存 UTC）。
+巡检按基准时刻把证据分成两类：
+
+- **即将过期**（`expiring`）：`now < valid_until <= now + warning_days`；
+- **已过期**（`expired`）：`valid_until <= now`；
+- 已撤回的版本/材料不参与巡检。
+
+每次巡检生成一个**巡检批次**（`inspection_batches`），历史批次永久保留、
+随时可读；提醒按 **reminder_key** 去重（`inspection_findings` 唯一键）：
+
+- 即将过期键含有效期时刻：`expiring:{version_id}:{valid_until}`，同一版本
+  在同一有效期内只提醒一次，续期后以新有效期再提醒；
+- 已过期键：`expired:{version_id}:{valid_until}`，每段有效期只提醒一次；
+- 重复巡检只在 `inspection_hits` 追加命中记录（更新剩余天数），不再生成
+  提醒。全部写入在单个 `BEGIN IMMEDIATE` 事务内，UNIQUE 约束 + INSERT OR
+  IGNORE 兜底并发，Python 脚本/多进程重复执行幂等（支持 Idempotency-Key）。
+
+```bash
+# 离线巡检（系统身份，无需服务进程），可重复执行
+python3 -m service_09252_006.cli inspect --db ./data/qe.db --warning-days 30 --json
+```
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/v1/versions/{id}/expiry` | 登记/续期证据有效期 |
+| GET  | `/v1/versions/{id}/expiry` | 查看有效期 |
+| POST | `/v1/inspections` | 执行巡检，返回 expiring/expired 两份清单 |
+| GET  | `/v1/inspections` | 历史巡检批次列表 |
+| GET  | `/v1/inspections/{batch_id}` | 读取某批次的两类清单 |
+
+质量权威可全局或按机构巡检；机构管理员仅巡检/查看本机构。
+
 ## 离线完整性核验
 
 不需要服务进程，只读打开数据库，重算全部内容摘要、封存清单指纹与评审
@@ -122,5 +156,10 @@ python3 -m compileall -q service_09252_006 tests
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
 多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
 端到端流程。
+
+证据有效期巡检另覆盖：**即将过期/已过期两类清单分别读取**、重复巡检
+（同进程推进时钟与跨进程 CLI 重跑）不重复生成提醒、历史批次与当时剩余
+天数可查、Idempotency-Key 回放、续期后按新有效期再提醒、撤回证据排除、
+机构范围权限与 v1→v2 SQLite 在线迁移。
 
 扩展模块覆盖证据、审批、权限、留存、对账与恢复等业务边界。

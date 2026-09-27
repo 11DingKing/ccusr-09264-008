@@ -146,5 +146,70 @@ class AuditEntry:
     detail: dict = field(default_factory=dict)
 
 
+@dataclass
+class EvidenceExpiry:
+    """证据版本的有效期登记（一个版本至多一条，可续期为更晚时刻）。"""
+
+    version_id: str                 # 主键，1:1 指向 versions
+    material_id: str
+    institution_id: str
+    valid_until: str                # 失效时刻，UTC ISO-8601 绝对时刻
+    set_by: str
+    set_at: str
+    source: str = ""                # 登记依据/来源说明
+    note: str = ""
+
+
+@dataclass
+class ExpiryCandidate:
+    """巡检扫描命中的一行：有效期信息 + 材料展示字段。"""
+
+    expiry: EvidenceExpiry
+    kind: str
+    title: str
+    sensitivity: str
+
+
+@dataclass
+class InspectionBatch:
+    """一次证据有效期巡检批次；历史批次永久保留、随时可查。"""
+
+    batch_id: str
+    run_at: str                     # 巡检执行时刻（UTC ISO）
+    as_of: str                      # 判定基准时刻（UTC ISO）
+    horizon: str                    # 即将过期窗口终点（UTC ISO）
+    warning_days: int
+    institution_id: Optional[str]   # 非空表示本批次仅巡检该机构
+    expiring_count: int = 0
+    expired_count: int = 0
+    new_reminder_count: int = 0
+    note: str = ""
+
+
+@dataclass
+class InspectionFinding:
+    """巡检发现项（即将过期/已过期各一条提醒）。
+
+    reminder_key 全局唯一：同一份证据在同一有效期下，重复巡检只生成一次
+    提醒；续期后产生新的即将过期键，已过期键每版本仅一次。
+    """
+
+    finding_id: str
+    batch_id: str
+    reminder_key: str
+    category: str                   # InspectionCategory: expiring | expired
+    version_id: str
+    material_id: str
+    institution_id: str
+    valid_until: str
+    days_remaining: int             # 即将过期为正/零，已过期为负
+    kind: str
+    title: str
+    sensitivity: str
+    first_seen_batch_id: str        # 该提醒首次出现的批次（可能早于本批次）
+    first_seen_at: str
+    created_at: str
+
+
 def asdict(obj) -> dict:
     return dataclasses.asdict(obj)

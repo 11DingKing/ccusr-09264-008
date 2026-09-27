@@ -12,6 +12,10 @@ from contextlib import AbstractContextManager
 from ..domain.models import (
     AuditEntry,
     Blob,
+    EvidenceExpiry,
+    ExpiryCandidate,
+    InspectionBatch,
+    InspectionFinding,
     Material,
     MaterialVersion,
     Objection,
@@ -148,3 +152,66 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 证据有效期 ----
+    @abc.abstractmethod
+    def upsert_expiry(self, expiry: EvidenceExpiry) -> None:
+        """登记或续期一个版本的有效期（1:1）。"""
+
+    @abc.abstractmethod
+    def get_expiry(self, version_id: str) -> EvidenceExpiry | None: ...
+
+    @abc.abstractmethod
+    def list_expiry_candidates(
+        self, as_of_iso: str, horizon_iso: str, institution_id: str | None = None
+    ) -> tuple[list[ExpiryCandidate], list[ExpiryCandidate]]:
+        """按基准时刻返回 (即将过期, 已过期) 两类候选。
+
+        仅包含版本/材料均未撤回的证据；即将过期为
+        as_of < valid_until <= horizon，已过期为 valid_until <= as_of。
+        """
+
+    # ---- 巡检批次与提醒 ----
+    @abc.abstractmethod
+    def insert_inspection_batch(self, batch: InspectionBatch) -> None: ...
+
+    @abc.abstractmethod
+    def update_inspection_counts(
+        self,
+        batch_id: str,
+        *,
+        expiring_count: int,
+        expired_count: int,
+        new_reminder_count: int,
+    ) -> None:
+        """批次扫描结束后回填清单计数（同一写事务内）。"""
+
+    @abc.abstractmethod
+    def get_inspection_batch(self, batch_id: str) -> InspectionBatch | None: ...
+
+    @abc.abstractmethod
+    def list_inspection_batches(
+        self, limit: int = 50
+    ) -> list[InspectionBatch]: ...
+
+    @abc.abstractmethod
+    def insert_inspection_finding(self, finding: InspectionFinding) -> bool:
+        """插入提醒发现；reminder_key 已存在时返回 False（不重复生成提醒）。"""
+
+    @abc.abstractmethod
+    def record_inspection_hit(
+        self, reminder_key: str, batch_id: str, as_of_iso: str, days_remaining: int
+    ) -> bool:
+        """记录提醒在某批次被再次巡检到（同批次重复返回 False）。"""
+
+    @abc.abstractmethod
+    def get_reminder(self, reminder_key: str) -> InspectionFinding | None: ...
+
+    @abc.abstractmethod
+    def list_findings_by_batch(
+        self, batch_id: str, category: str | None = None
+    ) -> list[InspectionFinding]: ...
+
+    @abc.abstractmethod
+    def count_inspection_findings(self, reminder_key: str) -> int:
+        """统计一个提醒键在多少个批次中被重复巡检到（历史可追踪）。"""

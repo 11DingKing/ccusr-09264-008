@@ -4,9 +4,15 @@
   python3 -m service_09252_006.cli serve   --db ./data/qe.db --host 127.0.0.1 --port 8080 \\
       --bootstrap-token <token>
   python3 -m service_09252_006.cli verify  --db ./data/qe.db [--json]
+  python3 -m service_09252_006.cli inspect --db ./data/qe.db [--warning-days 30] \\
+      [--institution <id>] [--json]
 
 verify 为离线核验：不需要服务进程，只读打开数据库并重算全部指纹。
 核验通过退出码 0；发现不一致退出码 2；数据库无法打开退出码 1。
+
+inspect 执行证据有效期巡检（系统身份，无需在线服务）：按预警窗口找出
+即将过期与已过期证据，生成巡检批次；重复执行只新增批次与命中记录，
+不重复生成提醒。退出码 0。
 """
 from __future__ import annotations
 
@@ -34,12 +40,21 @@ def main(argv: list[str] | None = None) -> int:
     verify_p.add_argument("--db", required=True)
     verify_p.add_argument("--json", action="store_true", help="只输出 JSON 报告")
 
+    inspect_p = sub.add_parser("inspect", help="证据有效期巡检")
+    inspect_p.add_argument("--db", required=True)
+    inspect_p.add_argument("--warning-days", type=int, default=30)
+    inspect_p.add_argument("--institution", default=None, help="仅巡检指定机构")
+    inspect_p.add_argument("--json", action="store_true", help="输出 JSON 批次视图")
+    inspect_p.add_argument("--note", default="")
+
     args = parser.parse_args(argv)
 
     if args.command == "serve":
         return _serve(args)
     if args.command == "verify":
         return _verify(args)
+    if args.command == "inspect":
+        return _inspect(args)
     return 1
 
 
@@ -90,6 +105,38 @@ def _print_human(report) -> None:
         print(f"  [警告] {warning['kind']}: {warning}")
     for failure in d["failures"]:
         print(f"  [失败] {failure['kind']}: {failure}")
+
+
+def _inspect(args: argparse.Namespace) -> int:
+    try:
+        with ApplicationContext(args.db) as context:
+            view = context.inspections.run_inspection(
+                None,
+                warning_days=args.warning_days,
+                institution_id=args.institution,
+                note=args.note,
+            )
+    except (sqlite3.Error, OSError) as exc:
+        print(f"无法打开数据库: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(view, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("证据有效期巡检批次 " + view["batch_id"])
+        print("=" * 40)
+        print(f"基准时刻: {view['as_of']}  预警窗口(天): {view['warning_days']}")
+        print(
+            f"即将过期: {view['expiring_count']}  已过期: {view['expired_count']}"
+            f"  新增提醒: {view['new_reminder_count']}"
+        )
+        for item in view["expiring"]:
+            print(f"  [即将过期] {item['version_id']} {item['title']}"
+                  f" 失效于 {item['valid_until']} (剩 {item['days_remaining']} 天)")
+        for item in view["expired"]:
+            print(f"  [已过期]   {item['version_id']} {item['title']}"
+                  f" 失效于 {item['valid_until']} ({item['days_remaining']} 天)")
+    return 0
 
 
 if __name__ == "__main__":

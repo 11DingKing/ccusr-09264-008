@@ -18,6 +18,10 @@ from ..domain.fingerprint import digest_bytes
 from ..domain.models import (
     AuditEntry,
     Blob,
+    EvidenceExpiry,
+    ExpiryCandidate,
+    InspectionBatch,
+    InspectionFinding,
     Material,
     MaterialVersion,
     Objection,
@@ -27,7 +31,7 @@ from ..domain.models import (
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -51,10 +55,11 @@ class SqliteRepository(Repository):
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
             return
-        # executescript 会自行提交事务；把 user_version 写入放在同一脚本
-        self._conn.executescript(
-            """
-                CREATE TABLE IF NOT EXISTS users (
+        if version == 0:
+            # executescript 会自行提交事务；把 user_version 写入放在同一脚本
+            self._conn.executescript(
+                """
+                    CREATE TABLE IF NOT EXISTS users (
                     user_id        TEXT PRIMARY KEY,
                     institution_id TEXT,
                     roles_json     TEXT NOT NULL,
@@ -178,7 +183,71 @@ class SqliteRepository(Repository):
 
                 PRAGMA user_version = 1;
             """
-        )
+            )
+        if version < 2:
+            # 证据有效期巡检：有效期登记、巡检批次、提醒键台账。
+            # executescript 会自行提交，与 v1 建表脚本同样处理。
+            self._conn.executescript(
+                """
+                        CREATE TABLE IF NOT EXISTS evidence_expiry (
+                            version_id     TEXT PRIMARY KEY REFERENCES versions(version_id),
+                            material_id    TEXT NOT NULL REFERENCES materials(material_id),
+                            institution_id TEXT NOT NULL,
+                            valid_until    TEXT NOT NULL,
+                            set_by         TEXT NOT NULL,
+                            set_at         TEXT NOT NULL,
+                            source         TEXT NOT NULL DEFAULT '',
+                            note           TEXT NOT NULL DEFAULT ''
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_expiry_valid_until
+                            ON evidence_expiry(valid_until);
+
+                        CREATE TABLE IF NOT EXISTS inspection_batches (
+                            batch_id        TEXT PRIMARY KEY,
+                            run_at          TEXT NOT NULL,
+                            as_of           TEXT NOT NULL,
+                            horizon         TEXT NOT NULL,
+                            warning_days    INTEGER NOT NULL,
+                            institution_id  TEXT,
+                            expiring_count  INTEGER NOT NULL DEFAULT 0,
+                            expired_count   INTEGER NOT NULL DEFAULT 0,
+                            new_reminder_count INTEGER NOT NULL DEFAULT 0,
+                            note            TEXT NOT NULL DEFAULT ''
+                        );
+
+                        CREATE TABLE IF NOT EXISTS inspection_findings (
+                            finding_id          TEXT PRIMARY KEY,
+                            batch_id            TEXT NOT NULL REFERENCES inspection_batches(batch_id),
+                            reminder_key        TEXT NOT NULL UNIQUE,
+                            category            TEXT NOT NULL,
+                            version_id          TEXT NOT NULL,
+                            material_id         TEXT NOT NULL,
+                            institution_id      TEXT NOT NULL,
+                            valid_until         TEXT NOT NULL,
+                            days_remaining      INTEGER NOT NULL,
+                            kind                TEXT NOT NULL DEFAULT '',
+                            title               TEXT NOT NULL DEFAULT '',
+                            sensitivity         TEXT NOT NULL DEFAULT '',
+                            first_seen_batch_id TEXT NOT NULL,
+                            first_seen_at       TEXT NOT NULL,
+                            created_at          TEXT NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_findings_batch
+                            ON inspection_findings(batch_id, category);
+
+                        CREATE TABLE IF NOT EXISTS inspection_hits (
+                            reminder_key TEXT NOT NULL
+                                REFERENCES inspection_findings(reminder_key),
+                            batch_id     TEXT NOT NULL
+                                REFERENCES inspection_batches(batch_id),
+                            as_of        TEXT NOT NULL,
+                            days_remaining INTEGER NOT NULL,
+                            PRIMARY KEY (reminder_key, batch_id)
+                        );
+
+                        PRAGMA user_version = 2;
+                    """
+                )
 
     @contextlib.contextmanager
     def _txn_direct(self) -> Iterator[None]:
@@ -667,6 +736,224 @@ class SqliteRepository(Repository):
             for r in rows
         ]
 
+    # ----------------------------------------------------- evidence expiry
+    def upsert_expiry(self, expiry: EvidenceExpiry) -> None:
+        self._conn.execute(
+            "INSERT INTO evidence_expiry(version_id, material_id, institution_id,"
+            " valid_until, set_by, set_at, source, note)"
+            " VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(version_id) DO UPDATE SET"
+            " material_id = excluded.material_id,"
+            " institution_id = excluded.institution_id,"
+            " valid_until = excluded.valid_until,"
+            " set_by = excluded.set_by,"
+            " set_at = excluded.set_at,"
+            " source = excluded.source,"
+            " note = excluded.note",
+            (
+                expiry.version_id,
+                expiry.material_id,
+                expiry.institution_id,
+                expiry.valid_until,
+                expiry.set_by,
+                expiry.set_at,
+                expiry.source,
+                expiry.note,
+            ),
+        )
+
+    def get_expiry(self, version_id: str) -> EvidenceExpiry | None:
+        row = self._conn.execute(
+            "SELECT * FROM evidence_expiry WHERE version_id = ?", (version_id,)
+        ).fetchone()
+        return None if row is None else _row_to_expiry(row)
+
+    def list_expiry_candidates(
+        self, as_of_iso: str, horizon_iso: str, institution_id: str | None = None
+    ) -> tuple[list[ExpiryCandidate], list[ExpiryCandidate]]:
+        # 已撤回的版本/材料不再产生提醒；有效期比较在 UTC ISO 字符串上进行，
+        # 统一格式（datetime.isoformat 产出定长、可字典序比较）。
+        scope = "AND e.institution_id = ?" if institution_id is not None else ""
+        params: list = [as_of_iso, horizon_iso]
+        if institution_id is not None:
+            params.append(institution_id)
+        expiring_rows = self._conn.execute(
+            f"""
+            SELECT e.*, m.kind AS m_kind, m.title AS m_title,
+                   m.sensitivity AS m_sensitivity
+            FROM evidence_expiry e
+            JOIN versions v ON v.version_id = e.version_id
+            JOIN materials m ON m.material_id = e.material_id
+            WHERE v.withdrawn = 0 AND m.withdrawn = 0
+              AND e.valid_until > ? AND e.valid_until <= ?
+              {scope}
+            ORDER BY e.valid_until, e.version_id
+            """,
+            params,
+        ).fetchall()
+        expired_params: list = [as_of_iso]
+        if institution_id is not None:
+            expired_params.append(institution_id)
+        expired_rows = self._conn.execute(
+            f"""
+            SELECT e.*, m.kind AS m_kind, m.title AS m_title,
+                   m.sensitivity AS m_sensitivity
+            FROM evidence_expiry e
+            JOIN versions v ON v.version_id = e.version_id
+            JOIN materials m ON m.material_id = e.material_id
+            WHERE v.withdrawn = 0 AND m.withdrawn = 0
+              AND e.valid_until <= ?
+              {scope}
+            ORDER BY e.valid_until, e.version_id
+            """,
+            expired_params,
+        ).fetchall()
+        return (
+            [_row_to_candidate(r) for r in expiring_rows],
+            [_row_to_candidate(r) for r in expired_rows],
+        )
+
+    # -------------------------------------------------------- inspections
+    def insert_inspection_batch(self, batch: InspectionBatch) -> None:
+        self._conn.execute(
+            "INSERT INTO inspection_batches(batch_id, run_at, as_of, horizon,"
+            " warning_days, institution_id, expiring_count, expired_count,"
+            " new_reminder_count, note)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                batch.batch_id,
+                batch.run_at,
+                batch.as_of,
+                batch.horizon,
+                batch.warning_days,
+                batch.institution_id,
+                batch.expiring_count,
+                batch.expired_count,
+                batch.new_reminder_count,
+                batch.note,
+            ),
+        )
+
+    def update_inspection_counts(
+        self,
+        batch_id: str,
+        *,
+        expiring_count: int,
+        expired_count: int,
+        new_reminder_count: int,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE inspection_batches SET expiring_count = ?, expired_count = ?,"
+            " new_reminder_count = ? WHERE batch_id = ?",
+            (expiring_count, expired_count, new_reminder_count, batch_id),
+        )
+
+    def _row_to_batch(self, row: sqlite3.Row) -> InspectionBatch:
+        return InspectionBatch(
+            batch_id=row["batch_id"],
+            run_at=row["run_at"],
+            as_of=row["as_of"],
+            horizon=row["horizon"],
+            warning_days=row["warning_days"],
+            institution_id=row["institution_id"],
+            expiring_count=row["expiring_count"],
+            expired_count=row["expired_count"],
+            new_reminder_count=row["new_reminder_count"],
+            note=row["note"],
+        )
+
+    def get_inspection_batch(self, batch_id: str) -> InspectionBatch | None:
+        row = self._conn.execute(
+            "SELECT * FROM inspection_batches WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_batch(row)
+
+    def list_inspection_batches(self, limit: int = 50) -> list[InspectionBatch]:
+        rows = self._conn.execute(
+            "SELECT * FROM inspection_batches ORDER BY run_at DESC, batch_id DESC"
+            " LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._row_to_batch(r) for r in rows]
+
+    def insert_inspection_finding(self, finding: InspectionFinding) -> bool:
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO inspection_findings(finding_id, batch_id,"
+            " reminder_key, category, version_id, material_id, institution_id,"
+            " valid_until, days_remaining, kind, title, sensitivity,"
+            " first_seen_batch_id, first_seen_at, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                finding.finding_id,
+                finding.batch_id,
+                finding.reminder_key,
+                finding.category,
+                finding.version_id,
+                finding.material_id,
+                finding.institution_id,
+                finding.valid_until,
+                finding.days_remaining,
+                finding.kind,
+                finding.title,
+                finding.sensitivity,
+                finding.first_seen_batch_id,
+                finding.first_seen_at,
+                finding.created_at,
+            ),
+        )
+        return cur.rowcount == 1
+
+    def record_inspection_hit(
+        self, reminder_key: str, batch_id: str, as_of_iso: str, days_remaining: int
+    ) -> bool:
+        """记录某提醒在本批次被再次巡检到；同批次重复返回 False。"""
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO inspection_hits(reminder_key, batch_id, as_of,"
+            " days_remaining) VALUES(?,?,?,?)",
+            (reminder_key, batch_id, as_of_iso, days_remaining),
+        )
+        return cur.rowcount == 1
+
+    def get_reminder(self, reminder_key: str) -> InspectionFinding | None:
+        row = self._conn.execute(
+            "SELECT * FROM inspection_findings WHERE reminder_key = ?",
+            (reminder_key,),
+        ).fetchone()
+        return None if row is None else _row_to_finding(row)
+
+    def list_findings_by_batch(
+        self, batch_id: str, category: str | None = None
+    ) -> list[InspectionFinding]:
+        # 经 inspection_hits 关联：重复巡检到的既有提醒也出现在本批次清单中，
+        # days_remaining 取本批次命中时的值。
+        if category is None:
+            sql = (
+                "SELECT f.*, h.days_remaining AS hit_days_remaining"
+                " FROM inspection_hits h"
+                " JOIN inspection_findings f ON f.reminder_key = h.reminder_key"
+                " WHERE h.batch_id = ?"
+                " ORDER BY f.category, f.valid_until, f.version_id"
+            )
+            params: tuple = (batch_id,)
+        else:
+            sql = (
+                "SELECT f.*, h.days_remaining AS hit_days_remaining"
+                " FROM inspection_hits h"
+                " JOIN inspection_findings f ON f.reminder_key = h.reminder_key"
+                " WHERE h.batch_id = ? AND f.category = ?"
+                " ORDER BY f.valid_until, f.version_id"
+            )
+            params = (batch_id, category)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_finding(r) for r in rows]
+
+    def count_inspection_findings(self, reminder_key: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM inspection_hits WHERE reminder_key = ?",
+            (reminder_key,),
+        ).fetchone()
+        return int(row[0])
+
 
 def _row_to_user(row: sqlite3.Row) -> User:
     return User(
@@ -716,4 +1003,53 @@ def _row_to_entry(row: sqlite3.Row) -> PackageEntry:
         kind=row["kind"],
         sensitivity=row["sensitivity"],
         added_at=row["added_at"],
+    )
+
+
+def _row_to_expiry(row: sqlite3.Row) -> EvidenceExpiry:
+    return EvidenceExpiry(
+        version_id=row["version_id"],
+        material_id=row["material_id"],
+        institution_id=row["institution_id"],
+        valid_until=row["valid_until"],
+        set_by=row["set_by"],
+        set_at=row["set_at"],
+        source=row["source"],
+        note=row["note"],
+    )
+
+
+def _row_to_candidate(row: sqlite3.Row) -> ExpiryCandidate:
+    return ExpiryCandidate(
+        expiry=_row_to_expiry(row),
+        kind=row["m_kind"],
+        title=row["m_title"],
+        sensitivity=row["m_sensitivity"],
+    )
+
+
+def _row_to_finding(row: sqlite3.Row) -> InspectionFinding:
+    keys = row.keys()
+    # 经 inspection_hits JOIN 时，剩余天数取命中批次当时的值
+    days_remaining = (
+        row["hit_days_remaining"]
+        if "hit_days_remaining" in keys
+        else row["days_remaining"]
+    )
+    return InspectionFinding(
+        finding_id=row["finding_id"],
+        batch_id=row["batch_id"],
+        reminder_key=row["reminder_key"],
+        category=row["category"],
+        version_id=row["version_id"],
+        material_id=row["material_id"],
+        institution_id=row["institution_id"],
+        valid_until=row["valid_until"],
+        days_remaining=days_remaining,
+        kind=row["kind"],
+        title=row["title"],
+        sensitivity=row["sensitivity"],
+        first_seen_batch_id=row["first_seen_batch_id"],
+        first_seen_at=row["first_seen_at"],
+        created_at=row["created_at"],
     )
