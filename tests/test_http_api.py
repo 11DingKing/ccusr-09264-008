@@ -197,6 +197,101 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
 
+    def test_inspection_endpoints_and_dedup(self) -> None:
+        admin = self._create_user(
+            "admin-a", ["institution_admin"], "inst-a", "tok-admin"
+        )
+        authority = self._create_user(
+            "auth", ["quality_authority"], None, "tok-auth"
+        )
+        submitter = self._create_user(
+            "sub-a", ["institution_submitter"], "inst-a", "tok-sub"
+        )
+
+        def upload(mid, content, valid_until=None, tz=None):
+            body = {"content_base64": base64.b64encode(content).decode("ascii")}
+            if valid_until:
+                body["valid_until"] = valid_until
+            if tz:
+                body["valid_until_timezone"] = tz
+            return admin.request(
+                "POST", f"/v1/materials/{mid}/versions", body
+            )
+
+        status, mat1 = admin.request(
+            "POST", "/v1/materials",
+            {"kind": "syllabus", "title": "即将过期"},
+        )
+        self.assertEqual(status, 201)
+        # 固定时钟 2026-09-25T01:00Z：10 天后到期
+        status, v1 = upload(
+            mat1["material_id"], b"soon", "2026-10-05T01:00:00+00:00"
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(v1["valid_until"], "2026-10-05T01:00:00+00:00")
+
+        status, mat2 = admin.request(
+            "POST", "/v1/materials",
+            {"kind": "syllabus", "title": "已过期"},
+        )
+        self.assertEqual(status, 201)
+        status, _ = upload(
+            mat2["material_id"], b"past", "2026-09-20T01:00:00+00:00"
+        )
+        self.assertEqual(status, 201)
+
+        # 提交人无权巡检
+        status, body = submitter.request("POST", "/v1/inspections", {})
+        self.assertEqual(status, 403)
+
+        # 首次巡检
+        status, first = authority.request(
+            "POST", "/v1/inspections", {"window_days": 30}
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(first["expiring_count"], 1)
+        self.assertEqual(first["expired_count"], 1)
+        self.assertEqual(first["reminded_count"], 2)
+        bid = first["batch_id"]
+
+        # 分别读取两类清单
+        status, exp = authority.request(
+            "GET", f"/v1/inspections/{bid}/findings?category=expiring"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(exp["findings"]), 1)
+        self.assertEqual(exp["findings"][0]["title"], "即将过期")
+        status, exd = authority.request(
+            "GET", f"/v1/inspections/{bid}/findings?category=expired"
+        )
+        self.assertEqual(exd["findings"][0]["title"], "已过期")
+
+        # 批次详情与历史列表
+        status, detail = authority.request("GET", f"/v1/inspections/{bid}")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(detail["expiring"]), 1)
+
+        # 重复巡检：新批次但无新提醒
+        status, second = authority.request("POST", "/v1/inspections", {})
+        self.assertEqual(status, 201)
+        self.assertNotEqual(second["batch_id"], bid)
+        self.assertEqual(second["reminded_count"], 0)
+        self.assertFalse(second["expiring"][0]["reminded"])
+
+        status, listing = authority.request("GET", "/v1/inspections")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["batches"]), 2)
+
+        # 幂等键重放
+        status, r1 = authority.request(
+            "POST", "/v1/inspections", {}, idempotency_key="cron-weekly"
+        )
+        status, r2 = authority.request(
+            "POST", "/v1/inspections", {}, idempotency_key="cron-weekly"
+        )
+        self.assertEqual(r1["batch_id"], r2["batch_id"])
+        self.assertTrue(r2["replayed"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -53,3 +53,20 @@ def to_local(deadline_utc_iso: str, tz_name: str) -> str:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return moment.astimezone(tz).isoformat()
+
+
+def resolve_validity_moment(iso: str, tz_name: str | None) -> str:
+    """解析证据有效期为 UTC ISO 串。
+
+    入参自带 UTC 偏移量时直接换算；为本地墙上时间时必须给 IANA 时区。
+    无法解析/未知时区抛 ValueError。
+    """
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except ValueError as exc:
+        raise ValueError(f"无法解析时间: {iso}") from exc
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).isoformat()
+    if not tz_name:
+        raise ValueError("本地时间必须提供 IANA 时区（valid_until_timezone）")
+    return resolve_deadline(iso, tz_name).at_utc_iso

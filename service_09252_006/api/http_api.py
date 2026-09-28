@@ -125,6 +125,11 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _idempotency_key(self) -> str | None:
         return self.headers.get("Idempotency-Key")
 
+    def _query_params(self) -> dict:
+        from urllib.parse import parse_qs
+
+        return parse_qs(urlparse(self.path).query)
+
     def _actor(self) -> User:
         from ..domain.errors import PermissionDeniedError
 
@@ -221,6 +226,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             data=data,
             media_type=body.get("media_type", "application/octet-stream"),
             expected_sha256=body.get("expected_sha256"),
+            valid_until_iso=body.get("valid_until"),
+            valid_until_timezone=body.get("valid_until_timezone"),
             idempotency_key=self._idempotency_key(),
         )
         self._send_json(201, result)
@@ -394,6 +401,38 @@ class ApiHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # ----------------------------------------------------------- 巡检
+    def run_inspection(self) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.inspections.run_inspection(
+            actor,
+            window_days=body.get("window_days", 30),
+            institution_id=body.get("institution_id"),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def list_inspection_batches(self) -> None:
+        actor = self._actor()
+        query = self._query_params()
+        limit = int(query.get("limit", ["50"])[0])
+        self._send_json(200, self.services.inspections.list_batches(actor, limit=limit))
+
+    def get_inspection_batch(self, batch_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, self.services.inspections.get_batch(actor, batch_id)
+        )
+
+    def list_inspection_findings(self, batch_id: str) -> None:
+        actor = self._actor()
+        category = self._query_params().get("category", [None])[0]
+        self._send_json(
+            200,
+            self.services.inspections.list_findings(actor, batch_id, category),
+        )
+
 
 # 路由表：方法 -> [(路径模式, 处理方法名)]
 def _routes() -> dict[str, list[tuple[str, str]]]:
@@ -413,6 +452,7 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
         ("/v1/requests/{request_id}/verdict", "submit_verdict"),
+        ("/v1/inspections", "run_inspection"),
     ]
     get = [
         ("/v1/materials/{material_id}", "get_material"),
@@ -424,6 +464,9 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",
         ),
+        ("/v1/inspections", "list_inspection_batches"),
+        ("/v1/inspections/{batch_id}", "get_inspection_batch"),
+        ("/v1/inspections/{batch_id}/findings", "list_inspection_findings"),
     ]
     return {"POST": post, "GET": get}
 

@@ -4,9 +4,13 @@
   python3 -m service_09252_006.cli serve   --db ./data/qe.db --host 127.0.0.1 --port 8080 \\
       --bootstrap-token <token>
   python3 -m service_09252_006.cli verify  --db ./data/qe.db [--json]
+  python3 -m service_09252_006.cli inspect --db ./data/qe.db [--window-days 30] [--json]
 
 verify 为离线核验：不需要服务进程，只读打开数据库并重算全部指纹。
 核验通过退出码 0；发现不一致退出码 2；数据库无法打开退出码 1。
+
+inspect 执行证据有效期巡检：重复执行不会重复生成提醒（提醒键唯一），
+但每次巡检批次都会留档，历史批次可查。
 """
 from __future__ import annotations
 
@@ -18,6 +22,16 @@ import sys
 from .application.container import ApplicationContext
 from .application.verification import verify_database
 from .api.http_api import HttpApiServer
+from .domain.enums import Role
+from .domain.models import User
+
+# 离线/定时巡检的固定操作身份（审计中可辨识）
+_SYSTEM_INSPECTOR = User(
+    user_id="system-inspector",
+    institution_id=None,
+    roles=(Role.QUALITY_AUTHORITY.value,),
+    display_name="系统巡检",
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,12 +48,25 @@ def main(argv: list[str] | None = None) -> int:
     verify_p.add_argument("--db", required=True)
     verify_p.add_argument("--json", action="store_true", help="只输出 JSON 报告")
 
+    inspect_p = sub.add_parser("inspect", help="执行证据有效期巡检")
+    inspect_p.add_argument("--db", required=True)
+    inspect_p.add_argument(
+        "--window-days", type=int, default=30, help="即将过期窗口（天）"
+    )
+    inspect_p.add_argument("--institution", default=None, help="只巡检指定机构")
+    inspect_p.add_argument(
+        "--idempotency-key", default=None, help="定时任务可提供固定键实现重跑回放"
+    )
+    inspect_p.add_argument("--json", action="store_true", help="只输出 JSON")
+
     args = parser.parse_args(argv)
 
     if args.command == "serve":
         return _serve(args)
     if args.command == "verify":
         return _verify(args)
+    if args.command == "inspect":
+        return _inspect(args)
     return 1
 
 
@@ -90,6 +117,42 @@ def _print_human(report) -> None:
         print(f"  [警告] {warning['kind']}: {warning}")
     for failure in d["failures"]:
         print(f"  [失败] {failure['kind']}: {failure}")
+
+
+def _inspect(args: argparse.Namespace) -> int:
+    try:
+        with ApplicationContext(args.db) as context:
+            result = context.inspections.run_inspection(
+                _SYSTEM_INSPECTOR,
+                window_days=args.window_days,
+                institution_id=args.institution,
+                idempotency_key=args.idempotency_key,
+            )
+    except sqlite3.Error as exc:
+        print(f"无法打开数据库: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("证据有效期巡检")
+        print("==============")
+        print(f"批次: {result['batch_id']}  时刻: {result['inspected_at']}")
+        print(
+            f"即将过期: {result['expiring_count']}  已过期: {result['expired_count']}"
+            f"  本次新提醒: {result['reminded_count']}"
+        )
+        if result.get("replayed"):
+            print("（同幂等键重放：未生成新批次/新提醒）")
+        for label, key in (("即将过期", "expiring"), ("已过期", "expired")):
+            for f in result[key]:
+                flag = "提醒" if f["reminded"] else "已提醒过(抑制)"
+                print(
+                    f"  [{label}] {f['material_id']} {f['title']}"
+                    f" 版本={f['version_id']} 有效期至={f['valid_until']}"
+                    f" 剩余天数={f['days_remaining']} {flag}"
+                )
+    return 0
 
 
 if __name__ == "__main__":

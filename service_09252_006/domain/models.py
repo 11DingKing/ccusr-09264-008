@@ -61,6 +61,19 @@ class MaterialVersion:
     created_by: str
     created_at: str
     withdrawn: bool                # 该版本是否已撤回
+    valid_until: Optional[str] = None  # 证据有效期截止时刻（UTC）；None 表示长期有效
+
+
+@dataclass
+class ValidityCandidate:
+    """巡检查询返回的当前版本行（材料 + 当前版本的有效期信息）。"""
+
+    material_id: str
+    institution_id: str
+    kind: str
+    title: str
+    version_id: str
+    valid_until: str
 
 
 @dataclass
@@ -144,6 +157,39 @@ class AuditEntry:
     action: str
     at: str
     detail: dict = field(default_factory=dict)
+
+
+@dataclass
+class InspectionBatch:
+    """一次证据有效期巡检批次（结果快照，历史巡检长期可查）。"""
+
+    batch_id: str
+    inspected_at: str               # 巡检时刻（UTC）
+    window_days: int                # “即将过期”窗口
+    expiring_count: int
+    expired_count: int
+    reminded_count: int             # 本次新生成的提醒数（重复键被抑制）
+    idempotency_key: Optional[str] = None
+
+
+@dataclass
+class InspectionFinding:
+    """批次内的一条巡检结果。category 取 expiring / expired。"""
+
+    finding_id: str
+    batch_id: str
+    category: str                   # InspectionCategory
+    material_id: str
+    institution_id: str
+    kind: str
+    title: str
+    version_id: str
+    valid_until: str                # 有效期截止（UTC ISO）
+    days_remaining: Optional[int]   # 距过期整天数；已过期为负/0
+    reminder_key: str               # 去重提醒键 category:version_id
+    reminded: bool                  # 本次是否新生成提醒（False=键已存在被抑制）
+    reminded_at: Optional[str]      # 该提醒首次生成时刻
+    created_at: str
 
 
 def asdict(obj) -> dict:

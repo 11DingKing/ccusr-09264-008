@@ -18,6 +18,8 @@ from ..domain.fingerprint import digest_bytes
 from ..domain.models import (
     AuditEntry,
     Blob,
+    InspectionBatch,
+    InspectionFinding,
     Material,
     MaterialVersion,
     Objection,
@@ -25,9 +27,10 @@ from ..domain.models import (
     ReviewPackage,
     ReviewRequest,
     User,
+    ValidityCandidate,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -49,136 +52,184 @@ class SqliteRepository(Repository):
     # ---------------------------------------------------------------- schema
     def _ensure_schema(self) -> None:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version >= SCHEMA_VERSION:
-            return
-        # executescript 会自行提交事务；把 user_version 写入放在同一脚本
-        self._conn.executescript(
-            """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id        TEXT PRIMARY KEY,
-                    institution_id TEXT,
-                    roles_json     TEXT NOT NULL,
-                    display_name   TEXT NOT NULL DEFAULT ''
-                );
+        if version < 1:
+            # executescript 会自行提交事务；把 user_version 写入放在同一脚本
+            self._conn.executescript(
+                """
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id        TEXT PRIMARY KEY,
+                        institution_id TEXT,
+                        roles_json     TEXT NOT NULL,
+                        display_name   TEXT NOT NULL DEFAULT ''
+                    );
 
-                CREATE TABLE IF NOT EXISTS blobs (
-                    sha256     TEXT PRIMARY KEY,
-                    data       BLOB NOT NULL,
-                    media_type TEXT NOT NULL,
-                    size       INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
+                    CREATE TABLE IF NOT EXISTS blobs (
+                        sha256     TEXT PRIMARY KEY,
+                        data       BLOB NOT NULL,
+                        media_type TEXT NOT NULL,
+                        size       INTEGER NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
 
-                CREATE TABLE IF NOT EXISTS materials (
-                    material_id        TEXT PRIMARY KEY,
-                    institution_id     TEXT NOT NULL,
-                    kind               TEXT NOT NULL,
-                    sensitivity        TEXT NOT NULL,
-                    title              TEXT NOT NULL,
-                    current_version_id TEXT,
-                    withdrawn          INTEGER NOT NULL DEFAULT 0,
-                    created_at         TEXT NOT NULL
-                );
+                    CREATE TABLE IF NOT EXISTS materials (
+                        material_id        TEXT PRIMARY KEY,
+                        institution_id     TEXT NOT NULL,
+                        kind               TEXT NOT NULL,
+                        sensitivity        TEXT NOT NULL,
+                        title              TEXT NOT NULL,
+                        current_version_id TEXT,
+                        withdrawn          INTEGER NOT NULL DEFAULT 0,
+                        created_at         TEXT NOT NULL
+                    );
 
-                CREATE TABLE IF NOT EXISTS versions (
-                    version_id              TEXT PRIMARY KEY,
-                    material_id             TEXT NOT NULL REFERENCES materials(material_id),
-                    institution_id          TEXT NOT NULL,
-                    sha256                  TEXT NOT NULL,
-                    size                    INTEGER NOT NULL,
-                    media_type              TEXT NOT NULL,
-                    version_no              INTEGER NOT NULL,
-                    supersedes_version_id   TEXT,
-                    created_by              TEXT NOT NULL,
-                    created_at              TEXT NOT NULL,
-                    withdrawn               INTEGER NOT NULL DEFAULT 0,
-                    withdrawn_at            TEXT,
-                    UNIQUE(material_id, version_no)
-                );
+                    CREATE TABLE IF NOT EXISTS versions (
+                        version_id              TEXT PRIMARY KEY,
+                        material_id             TEXT NOT NULL REFERENCES materials(material_id),
+                        institution_id          TEXT NOT NULL,
+                        sha256                  TEXT NOT NULL,
+                        size                    INTEGER NOT NULL,
+                        media_type              TEXT NOT NULL,
+                        version_no              INTEGER NOT NULL,
+                        supersedes_version_id   TEXT,
+                        created_by              TEXT NOT NULL,
+                        created_at              TEXT NOT NULL,
+                        withdrawn               INTEGER NOT NULL DEFAULT 0,
+                        withdrawn_at            TEXT,
+                        UNIQUE(material_id, version_no)
+                    );
 
-                CREATE TABLE IF NOT EXISTS packages (
-                    package_id            TEXT PRIMARY KEY,
-                    institution_id        TEXT NOT NULL,
-                    title                 TEXT NOT NULL,
-                    status                TEXT NOT NULL,
-                    created_by            TEXT NOT NULL,
-                    created_at            TEXT NOT NULL,
-                    sealed_at             TEXT,
-                    manifest_fingerprint  TEXT,
-                    decided_at            TEXT,
-                    decision              TEXT,
-                    decision_note         TEXT,
-                    review_fingerprint    TEXT,
-                    supersedes_package_id TEXT
-                );
+                    CREATE TABLE IF NOT EXISTS packages (
+                        package_id            TEXT PRIMARY KEY,
+                        institution_id        TEXT NOT NULL,
+                        title                 TEXT NOT NULL,
+                        status                TEXT NOT NULL,
+                        created_by            TEXT NOT NULL,
+                        created_at            TEXT NOT NULL,
+                        sealed_at             TEXT,
+                        manifest_fingerprint  TEXT,
+                        decided_at            TEXT,
+                        decision              TEXT,
+                        decision_note         TEXT,
+                        review_fingerprint    TEXT,
+                        supersedes_package_id TEXT
+                    );
 
-                CREATE TABLE IF NOT EXISTS entries (
-                    entry_id    TEXT PRIMARY KEY,
-                    package_id  TEXT NOT NULL REFERENCES packages(package_id),
-                    material_id TEXT NOT NULL,
-                    version_id  TEXT NOT NULL REFERENCES versions(version_id),
-                    sha256      TEXT NOT NULL,
-                    kind        TEXT NOT NULL,
-                    sensitivity TEXT NOT NULL,
-                    added_at    TEXT NOT NULL,
-                    UNIQUE(package_id, version_id)
-                );
+                    CREATE TABLE IF NOT EXISTS entries (
+                        entry_id    TEXT PRIMARY KEY,
+                        package_id  TEXT NOT NULL REFERENCES packages(package_id),
+                        material_id TEXT NOT NULL,
+                        version_id  TEXT NOT NULL REFERENCES versions(version_id),
+                        sha256      TEXT NOT NULL,
+                        kind        TEXT NOT NULL,
+                        sensitivity TEXT NOT NULL,
+                        added_at    TEXT NOT NULL,
+                        UNIQUE(package_id, version_id)
+                    );
 
-                CREATE TABLE IF NOT EXISTS requests (
-                    request_id       TEXT PRIMARY KEY,
-                    package_id       TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id   TEXT NOT NULL,
-                    reviewer_id      TEXT NOT NULL,
-                    status           TEXT NOT NULL,
-                    assigned_by      TEXT NOT NULL,
-                    assigned_at      TEXT NOT NULL,
-                    responded_at     TEXT,
-                    completed_at     TEXT,
-                    verdict          TEXT,
-                    comment          TEXT,
-                    deadline_at_utc  TEXT,
-                    deadline_timezone TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_requests_reviewer
-                    ON requests(reviewer_id, status);
-                CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
+                    CREATE TABLE IF NOT EXISTS requests (
+                        request_id       TEXT PRIMARY KEY,
+                        package_id       TEXT NOT NULL REFERENCES packages(package_id),
+                        institution_id   TEXT NOT NULL,
+                        reviewer_id      TEXT NOT NULL,
+                        status           TEXT NOT NULL,
+                        assigned_by      TEXT NOT NULL,
+                        assigned_at      TEXT NOT NULL,
+                        responded_at     TEXT,
+                        completed_at     TEXT,
+                        verdict          TEXT,
+                        comment          TEXT,
+                        deadline_at_utc  TEXT,
+                        deadline_timezone TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_requests_reviewer
+                        ON requests(reviewer_id, status);
+                    CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
 
-                CREATE TABLE IF NOT EXISTS objections (
-                    objection_id  TEXT PRIMARY KEY,
-                    request_id    TEXT NOT NULL REFERENCES requests(request_id),
-                    package_id    TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id TEXT NOT NULL,
-                    reviewer_id   TEXT NOT NULL,
-                    category      TEXT NOT NULL,
-                    detail        TEXT NOT NULL,
-                    created_at    TEXT NOT NULL
-                );
+                    CREATE TABLE IF NOT EXISTS objections (
+                        objection_id  TEXT PRIMARY KEY,
+                        request_id    TEXT NOT NULL REFERENCES requests(request_id),
+                        package_id    TEXT NOT NULL REFERENCES packages(package_id),
+                        institution_id TEXT NOT NULL,
+                        reviewer_id   TEXT NOT NULL,
+                        category      TEXT NOT NULL,
+                        detail        TEXT NOT NULL,
+                        created_at    TEXT NOT NULL
+                    );
 
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    audit_id       TEXT PRIMARY KEY,
-                    package_id     TEXT,
-                    institution_id TEXT,
-                    actor_id       TEXT NOT NULL,
-                    action         TEXT NOT NULL,
-                    at             TEXT NOT NULL,
-                    detail_json    TEXT NOT NULL DEFAULT '{}'
-                );
+                    CREATE TABLE IF NOT EXISTS audit_log (
+                        audit_id       TEXT PRIMARY KEY,
+                        package_id     TEXT,
+                        institution_id TEXT,
+                        actor_id       TEXT NOT NULL,
+                        action         TEXT NOT NULL,
+                        at             TEXT NOT NULL,
+                        detail_json    TEXT NOT NULL DEFAULT '{}'
+                    );
 
-                CREATE TABLE IF NOT EXISTS idempotency (
-                    idempotency_key TEXT PRIMARY KEY,
-                    result_json     TEXT NOT NULL,
-                    created_at      TEXT NOT NULL
-                );
+                    CREATE TABLE IF NOT EXISTS idempotency (
+                        idempotency_key TEXT PRIMARY KEY,
+                        result_json     TEXT NOT NULL,
+                        created_at      TEXT NOT NULL
+                    );
 
-                CREATE TABLE IF NOT EXISTS api_tokens (
-                    token       TEXT PRIMARY KEY,
-                    user_id     TEXT NOT NULL REFERENCES users(user_id),
-                    created_at  TEXT NOT NULL
-                );
+                    CREATE TABLE IF NOT EXISTS api_tokens (
+                        token       TEXT PRIMARY KEY,
+                        user_id     TEXT NOT NULL REFERENCES users(user_id),
+                        created_at  TEXT NOT NULL
+                    );
 
-                PRAGMA user_version = 1;
-            """
-        )
+                    PRAGMA user_version = 1;
+                """
+            )
+            version = 1
+        if version < 2:
+            # 证据有效期：版本有效期列 + 巡检批次/结果/提醒键
+            self._conn.executescript(
+                """
+                    ALTER TABLE versions ADD COLUMN valid_until TEXT;
+
+                    CREATE TABLE IF NOT EXISTS inspection_batches (
+                        batch_id        TEXT PRIMARY KEY,
+                        inspected_at    TEXT NOT NULL,
+                        window_days     INTEGER NOT NULL,
+                        expiring_count  INTEGER NOT NULL,
+                        expired_count   INTEGER NOT NULL,
+                        reminded_count  INTEGER NOT NULL,
+                        idempotency_key TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS inspection_findings (
+                        finding_id     TEXT PRIMARY KEY,
+                        batch_id       TEXT NOT NULL
+                            REFERENCES inspection_batches(batch_id),
+                        category       TEXT NOT NULL,
+                        material_id    TEXT NOT NULL,
+                        institution_id TEXT NOT NULL,
+                        kind           TEXT NOT NULL,
+                        title          TEXT NOT NULL,
+                        version_id     TEXT NOT NULL,
+                        valid_until    TEXT NOT NULL,
+                        days_remaining INTEGER,
+                        reminder_key   TEXT NOT NULL,
+                        reminded       INTEGER NOT NULL,
+                        reminded_at    TEXT,
+                        created_at     TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_findings_batch
+                        ON inspection_findings(batch_id, category);
+                    CREATE INDEX IF NOT EXISTS idx_findings_version
+                        ON inspection_findings(version_id);
+
+                    CREATE TABLE IF NOT EXISTS inspection_reminders (
+                        reminder_key      TEXT PRIMARY KEY,
+                        category          TEXT NOT NULL,
+                        version_id        TEXT NOT NULL,
+                        first_reminded_at TEXT NOT NULL
+                    );
+
+                    PRAGMA user_version = 2;
+                """
+            )
 
     @contextlib.contextmanager
     def _txn_direct(self) -> Iterator[None]:
@@ -325,8 +376,8 @@ class SqliteRepository(Repository):
         self._conn.execute(
             "INSERT INTO versions(version_id, material_id, institution_id, sha256,"
             " size, media_type, version_no, supersedes_version_id, created_by,"
-            " created_at, withdrawn)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            " created_at, withdrawn, valid_until)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 version.version_id,
                 version.material_id,
@@ -339,6 +390,7 @@ class SqliteRepository(Repository):
                 version.created_by,
                 version.created_at,
                 int(version.withdrawn),
+                version.valid_until,
             ),
         )
         self._conn.execute(
@@ -386,6 +438,34 @@ class SqliteRepository(Repository):
             (int(withdrawn), material_id),
         )
         return cur.rowcount == 1
+
+    def list_validity_candidates(
+        self, institution_id: str | None = None
+    ) -> list[ValidityCandidate]:
+        sql = (
+            "SELECT m.material_id AS material_id, m.institution_id AS institution_id,"
+            " m.kind AS kind, m.title AS title, v.version_id AS version_id,"
+            " v.valid_until AS valid_until"
+            " FROM materials m JOIN versions v ON v.version_id = m.current_version_id"
+            " WHERE m.withdrawn = 0 AND v.withdrawn = 0 AND v.valid_until IS NOT NULL"
+        )
+        params: tuple = ()
+        if institution_id is not None:
+            sql += " AND m.institution_id = ?"
+            params = (institution_id,)
+        sql += " ORDER BY m.material_id"
+        rows = self._conn.execute(sql, params).fetchall()
+        return [
+            ValidityCandidate(
+                material_id=r["material_id"],
+                institution_id=r["institution_id"],
+                kind=r["kind"],
+                title=r["title"],
+                version_id=r["version_id"],
+                valid_until=r["valid_until"],
+            )
+            for r in rows
+        ]
 
     # -------------------------------------------------------------- packages
     def insert_package(self, package: ReviewPackage) -> None:
@@ -667,6 +747,103 @@ class SqliteRepository(Repository):
             for r in rows
         ]
 
+    # ------------------------------------------------------------- 巡检
+    def insert_inspection_batch(self, batch: InspectionBatch) -> None:
+        self._conn.execute(
+            "INSERT INTO inspection_batches(batch_id, inspected_at, window_days,"
+            " expiring_count, expired_count, reminded_count, idempotency_key)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (
+                batch.batch_id,
+                batch.inspected_at,
+                batch.window_days,
+                batch.expiring_count,
+                batch.expired_count,
+                batch.reminded_count,
+                batch.idempotency_key,
+            ),
+        )
+
+    def get_inspection_batch(self, batch_id: str) -> InspectionBatch | None:
+        row = self._conn.execute(
+            "SELECT * FROM inspection_batches WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        return None if row is None else _row_to_batch(row)
+
+    def list_inspection_batches(self, limit: int = 50) -> list[InspectionBatch]:
+        rows = self._conn.execute(
+            "SELECT * FROM inspection_batches ORDER BY inspected_at DESC,"
+            " batch_id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [_row_to_batch(r) for r in rows]
+
+    def insert_inspection_finding(self, finding: InspectionFinding) -> None:
+        self._conn.execute(
+            "INSERT INTO inspection_findings(finding_id, batch_id, category,"
+            " material_id, institution_id, kind, title, version_id, valid_until,"
+            " days_remaining, reminder_key, reminded, reminded_at, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                finding.finding_id,
+                finding.batch_id,
+                finding.category,
+                finding.material_id,
+                finding.institution_id,
+                finding.kind,
+                finding.title,
+                finding.version_id,
+                finding.valid_until,
+                finding.days_remaining,
+                finding.reminder_key,
+                int(finding.reminded),
+                finding.reminded_at,
+                finding.created_at,
+            ),
+        )
+
+    def list_inspection_findings(
+        self, batch_id: str, category: str | None = None
+    ) -> list[InspectionFinding]:
+        if category is None:
+            rows = self._conn.execute(
+                "SELECT * FROM inspection_findings WHERE batch_id = ?"
+                " ORDER BY category, valid_until, material_id",
+                (batch_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM inspection_findings WHERE batch_id = ? AND category = ?"
+                " ORDER BY valid_until, material_id",
+                (batch_id, category),
+            ).fetchall()
+        return [_row_to_finding(r) for r in rows]
+
+    def get_reminder(self, reminder_key: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT reminder_key, category, version_id, first_reminded_at"
+            " FROM inspection_reminders WHERE reminder_key = ?",
+            (reminder_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "key": row["reminder_key"],
+            "category": row["category"],
+            "version_id": row["version_id"],
+            "first_reminded_at": row["first_reminded_at"],
+        }
+
+    def insert_reminder_ignore(
+        self, key: str, category: str, version_id: str, at: str
+    ) -> bool:
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO inspection_reminders(reminder_key, category,"
+            " version_id, first_reminded_at) VALUES(?,?,?,?)",
+            (key, category, version_id, at),
+        )
+        return cur.rowcount == 1
+
 
 def _row_to_user(row: sqlite3.Row) -> User:
     return User(
@@ -703,6 +880,39 @@ def _row_to_version(row: sqlite3.Row) -> MaterialVersion:
         created_by=row["created_by"],
         created_at=row["created_at"],
         withdrawn=bool(row["withdrawn"]),
+        valid_until=row["valid_until"],
+    )
+
+
+def _row_to_batch(row: sqlite3.Row) -> InspectionBatch:
+    keys = row.keys()
+    return InspectionBatch(
+        batch_id=row["batch_id"],
+        inspected_at=row["inspected_at"],
+        window_days=row["window_days"],
+        expiring_count=row["expiring_count"],
+        expired_count=row["expired_count"],
+        reminded_count=row["reminded_count"],
+        idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
+    )
+
+
+def _row_to_finding(row: sqlite3.Row) -> InspectionFinding:
+    return InspectionFinding(
+        finding_id=row["finding_id"],
+        batch_id=row["batch_id"],
+        category=row["category"],
+        material_id=row["material_id"],
+        institution_id=row["institution_id"],
+        kind=row["kind"],
+        title=row["title"],
+        version_id=row["version_id"],
+        valid_until=row["valid_until"],
+        days_remaining=row["days_remaining"],
+        reminder_key=row["reminder_key"],
+        reminded=bool(row["reminded"]),
+        reminded_at=row["reminded_at"],
+        created_at=row["created_at"],
     )
 
 

@@ -12,6 +12,8 @@ from contextlib import AbstractContextManager
 from ..domain.models import (
     AuditEntry,
     Blob,
+    InspectionBatch,
+    InspectionFinding,
     Material,
     MaterialVersion,
     Objection,
@@ -19,6 +21,7 @@ from ..domain.models import (
     ReviewPackage,
     ReviewRequest,
     User,
+    ValidityCandidate,
 )
 
 
@@ -148,3 +151,38 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 证据有效期巡检 ----
+    @abc.abstractmethod
+    def list_validity_candidates(
+        self, institution_id: str | None = None
+    ) -> list[ValidityCandidate]:
+        """各材料【当前版本】中设了有效期的，排除已撤回材料/版本。"""
+
+    @abc.abstractmethod
+    def insert_inspection_batch(self, batch: InspectionBatch) -> None: ...
+
+    @abc.abstractmethod
+    def get_inspection_batch(self, batch_id: str) -> InspectionBatch | None: ...
+
+    @abc.abstractmethod
+    def list_inspection_batches(
+        self, limit: int = 50
+    ) -> list[InspectionBatch]: ...
+
+    @abc.abstractmethod
+    def insert_inspection_finding(self, finding: InspectionFinding) -> None: ...
+
+    @abc.abstractmethod
+    def list_inspection_findings(
+        self, batch_id: str, category: str | None = None
+    ) -> list[InspectionFinding]:
+        """读取某批次结果；category 取 expiring/expired，None 为全部。"""
+
+    @abc.abstractmethod
+    def get_reminder(self, reminder_key: str) -> dict | None:
+        """返回 {"key", "first_reminded_at", "category", "version_id"} 或 None。"""
+
+    @abc.abstractmethod
+    def insert_reminder_ignore(self, key: str, category: str, version_id: str, at: str) -> bool:
+        """插入提醒键；键已存在则忽略，返回是否为新插入。"""

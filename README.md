@@ -46,15 +46,28 @@
 - 截止时间以“当地时间 + IANA 时区”输入，统一换算为 UTC 绝对时刻，正确
   处理跨时区与日界线。
 
+### 证据有效期巡检
+- 版本上传时可带 `valid_until`（带偏移量的 ISO 时刻，或本地时间 + IANA
+  时区），换算为 UTC 存储；不带表示长期有效。有效期挂在**不可变版本**上，
+  续期即上传新版本。
+- 巡检只看每份材料的**当前版本**，排除已撤回的材料/版本，按巡检时刻分两类：
+  `expiring`（窗口内即将过期）与 `expired`（已过期）。
+- 提醒以 `category:version_id` 为唯一键落库：同一证据同一类别只首次提醒，
+  重复巡检**不再重复提醒**（结果中 `reminded=false` 并带回首次提醒时刻）；
+  同一版本由“即将过期”转入“已过期”时，两类键各自提醒一次。
+- 每次巡检生成一个**批次快照**（批次 + 逐条结果），历史批次随时可查；
+  Python 重复执行/跨进程并发安全（`BEGIN IMMEDIATE` + 唯一键），并支持
+  `Idempotency-Key` 回放同一批次。
+
 ## 分层结构
 
 ```
 service_09252_006/
   domain/        实体、枚举、错误、指纹纯函数、披露策略
-  application/   用例服务（证据/评审包/评审）、端口（Clock、Id、Repository）
-  persistence/   SQLite 仓库（事务、条件迁移、幂等键、内容寻址）
+  application/   用例服务（证据/评审包/评审/有效期巡检）、端口（Clock、Id、Repository）
+  persistence/   SQLite 仓库（事务、条件迁移、幂等键、内容寻址、巡检批次与提醒键）
   api/           HTTP 边界（Bearer 鉴权、路由、JSON 编解码）
-  cli.py         serve / 离线 verify
+  cli.py         serve / 离线 verify / inspect 巡检
 ```
 
 时间与标识经可替换端口接入（`SystemClock`/`FixedClock`、
@@ -81,6 +94,18 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 
 退出码：`0` 通过，`2` 发现不一致/篡改，`1` 数据库无法打开。
 
+## 证据有效期巡检
+
+定时（周报前）执行；重复执行安全：不重复提醒，但每次批次都留档。
+
+```bash
+# 执行巡检（默认即将过期窗口 30 天），输出两类清单
+python3 -m service_09252_006.cli inspect --db ./data/qe.db [--window-days 30] [--json]
+# 定时任务可给固定幂等键，崩溃重跑/超时重发回放同一批次
+python3 -m service_09252_006.cli inspect --db ./data/qe.db \
+    --idempotency-key "inspect-$(date +%Y%m%d)" --json
+```
+
 ## HTTP API 摘要
 
 认证：`Authorization: Bearer <token>`；建用户/发 token 的引导端点用
@@ -91,7 +116,7 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/admin/users` | 引导：建用户/角色 |
 | POST | `/v1/admin/tokens` | 引导：签发 API token |
 | POST | `/v1/materials` | 登记材料（kind/sensitivity） |
-| POST | `/v1/materials/{id}/versions` | 上传版本（base64，内容寻址） |
+| POST | `/v1/materials/{id}/versions` | 上传版本（base64，内容寻址，可带 valid_until） |
 | POST | `/v1/versions/{id}/withdraw` | 撤回版本 |
 | POST | `/v1/materials/{id}/withdraw` | 撤回整份材料 |
 | POST | `/v1/packages` | 建评审包（可带 `supersedes_package_id`） |
@@ -106,6 +131,10 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/requests/{id}/verdict` | 提交 approve/object（object 须先有异议） |
 | POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权） |
 | POST | `/v1/packages/{id}/decision` | 签发 approved/needs_revision/rejected |
+| POST | `/v1/inspections` | 执行有效期巡检（window_days，可带机构范围） |
+| GET  | `/v1/inspections` | 历史批次列表 |
+| GET  | `/v1/inspections/{id}` | 批次详情（含 expiring/expired 两类清单） |
+| GET  | `/v1/inspections/{id}/findings?category=expiring\|expired` | 分类型读取结果 |
 
 评审状态机：`draft → sealed → under_review → decided`；复审包重新走一遍，
 旧包不复活。

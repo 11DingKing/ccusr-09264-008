@@ -14,6 +14,7 @@ from ..domain.errors import NotFoundError, PermissionDeniedError, ValidationErro
 from ..domain.fingerprint import digest_bytes
 from ..domain.models import Blob, Material, MaterialVersion, User
 from .base import Service, require_roles
+from .timeutil import resolve_validity_moment
 
 
 class EvidenceService(Service):
@@ -72,6 +73,8 @@ class EvidenceService(Service):
         data: bytes,
         media_type: str = "application/octet-stream",
         expected_sha256: str | None = None,
+        valid_until_iso: str | None = None,
+        valid_until_timezone: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict:
         require_roles(
@@ -89,6 +92,15 @@ class EvidenceService(Service):
                     "客户端提供的摘要与实际内容不一致",
                     details={"expected": expected_sha256, "actual": "sha256:" + sha},
                 )
+        # 有效期解析为 UTC 绝对时刻；None 表示该版本长期有效
+        valid_until = None
+        if valid_until_iso is not None and str(valid_until_iso).strip():
+            try:
+                valid_until = resolve_validity_moment(
+                    valid_until_iso.strip(), valid_until_timezone
+                )
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
 
         def work() -> dict:
             material = self.repo.get_material(material_id)
@@ -127,6 +139,7 @@ class EvidenceService(Service):
                 created_by=actor.user_id,
                 created_at=self.clock.now_iso(),
                 withdrawn=False,
+                valid_until=valid_until,
             )
             self.repo.insert_version(version)
             self.audit(
@@ -293,5 +306,6 @@ class EvidenceService(Service):
             "withdrawn": v.withdrawn,
             "created_by": v.created_by,
             "created_at": v.created_at,
+            "valid_until": v.valid_until,
             "replayed": replayed,
         }
